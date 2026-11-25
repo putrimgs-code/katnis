@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 NAME="Katnis"
-VER="${VER:-1.0.0}"
+VER="${VER:-1.0.1}"
 APP="build/$NAME.app"
 rm -rf build/Katnis.app build/dmg dist; mkdir -p build dist
 

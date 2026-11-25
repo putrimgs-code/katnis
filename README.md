@@ -43,7 +43,7 @@ Data disimpan di `~/Library/Application Support/Katnis/` (`store.json` + folder 
 ## Build
 
 ```sh
-./build.sh            # → dist/Katnis-1.0.0.dmg
+./build.sh            # → dist/Katnis-1.0.1.dmg
 VER=1.1.0 ./build.sh  # versi lain
 ```
 
@@ -54,7 +54,15 @@ Mode uji:
 ```sh
 build/Katnis.app/Contents/MacOS/Katnis --jejak 2026-11-19 --only claude   # JSON jejak satu hari
 build/Katnis.app/Contents/MacOS/Katnis --demo                             # data contoh, tidak menyimpan
+
+# Rekam suara tanpa mikrofon (audio dari file, mis. hasil `say -v Damayanti -o tes.aiff "..."`).
+# Pakai `open` supaya izin Pengenalan Ucapan atas nama Katnis, bukan Terminal.
+open -n -W -a build/Katnis.app --args --tes-rekam "$PWD/tes.aiff" --out "$PWD/hasil.txt"
+open -n -W -a build/Katnis.app --args --tes-suara "$PWD/tes.aiff" --out "$PWD/hasil.txt" --server
 ```
+
+Transkripsi suara mencoba on-device dulu. Kalau Dikte macOS mati atau model id-ID belum terpasang,
+otomatis pindah ke server Apple (audio tidak disimpan Katnis).
 
 Pratinjau UI di browser: buka `web/index.html` (otomatis memakai data contoh), mis. `web/index.html#gen,gelap`.
 

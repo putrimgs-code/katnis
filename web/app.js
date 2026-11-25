@@ -413,6 +413,10 @@ const VOICE_ERR = {
   MIC_DENIED: 'Izin mikrofon belum diberikan. Nyalakan di Pengaturan Sistem › Privasi & Keamanan › Mikrofon, atau ketik ceritamu langsung.',
   SPEECH_UNAVAILABLE: 'Pengenalan ucapan bahasa Indonesia belum tersedia di Mac ini. Ketik ceritamu langsung.',
   MIC_FAILED: 'Mikrofon tidak bisa dipakai. Ketik ceritamu langsung.',
+  SPEECH_RESTRICTED: 'Pengenalan ucapan dibatasi di Mac ini (profil kantor/Screen Time). Ketik ceritamu langsung.',
+  SPEECH_DICTATION_OFF: 'Dikte macOS sedang mati, jadi suara tidak bisa diubah jadi teks. Nyalakan di Pengaturan Sistem › Keyboard › Dikte, lalu rekam ulang. Atau ketik ceritamu langsung.',
+  SPEECH_NETWORK: 'Transkripsi butuh internet karena model bahasa Indonesia belum terpasang di Mac ini. Cek koneksi lalu rekam ulang, atau ketik ceritamu langsung.',
+  SPEECH_FAILED: 'Suara tidak bisa diubah jadi teks. Rekam ulang, atau ketik ceritamu langsung.',
 };
 async function startRec() {
   U.rec = { mode: 'starting', sec: 0, text: '', level: 0, err: '' }; render();
@@ -426,6 +430,11 @@ async function startRec() {
 function stopRec() { clearInterval(U.recT); if (U.rec.mode !== 'on') return; U.rec.mode = 'finishing'; native('voiceStop'); render(); setTimeout(() => { if (U.rec.mode === 'finishing') { U.rec.mode = 'done'; render(); } }, 3000); }
 function onVoice(p) {
   if (!U.cap || U.cap.type !== 'suara') return;
+  if (p.error && U.rec.mode !== 'idle') {
+    clearInterval(U.recT);
+    U.rec = { mode: 'idle', sec: 0, text: '', level: 0, err: VOICE_ERR[p.error] || VOICE_ERR.SPEECH_FAILED };
+    render(); return;
+  }
   if (p.text) U.rec.text = p.text;
   U.rec.level = p.level || 0;
   if (p.final && U.rec.mode === 'finishing') { U.rec.mode = 'done'; render(); return; }
@@ -641,6 +650,7 @@ function capHTML() {
       ${r.mode === 'idle' ? `<div class="btnrow"><button class="recbtn" data-act="recStart" data-autofocus><span class="recdot"></span>Mulai rekam</button><button class="btn sm" data-act="recType">Ketik saja</button></div>` : ''}
       ${r.mode === 'starting' ? `<div class="loading"><span class="spin"></span>Menyiapkan mikrofon…</div>` : ''}
       ${r.mode === 'on' || r.mode === 'finishing' ? `<div class="recon" aria-live="polite"><span class="recdot"></span><span class="mono" id="recTime" style="font-size:15px">${pad(Math.floor(r.sec / 60))}:${pad(r.sec % 60)}</span><div class="wave" id="wave" aria-hidden="true">${'<i style="height:4px"></i>'.repeat(WAVE)}</div>${r.mode === 'on' ? '<button class="btn sm" data-act="recStop">Selesai</button>' : '<span class="small">Menyelesaikan…</span>'}</div><div class="live" id="liveText">${esc(r.text || 'Mulai bicara…')}</div>` : ''}
+      ${r.mode === 'done' && r.sec && !(r.text || '').trim() ? `<p style="color:var(--text);font-weight:500">Belum ada suara yang tertangkap jadi teks. Cek mikrofon yang dipakai Mac, rekam ulang, atau ketik ceritamu di bawah.</p>` : ''}
       ${r.mode === 'done' ? `<label class="stack"><span class="small">Transkrip${r.sec ? ` ${pad(Math.floor(r.sec / 60))}:${pad(r.sec % 60)}` : ''} (bisa dikoreksi)</span><textarea class="field" rows="5" data-kf="rec" data-f="rec" placeholder="Ketik ceritamu…">${esc(r.text)}</textarea></label><button class="btn xs" data-act="recReset" style="align-self:flex-start">Rekam ulang</button>` : ''}
     </div>`;
   } else if (c.type === 'foto') {

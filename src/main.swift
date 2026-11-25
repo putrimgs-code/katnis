@@ -367,20 +367,43 @@ enum ClaudeRunner {
 }
 
 // MARK: - Rekam suara + transkripsi (Speech framework, audio tidak disimpan)
+//
+// Catatan perilaku Speech di macOS yang ditangani di sini:
+// - SFSpeechRecognizer harus disimpan selama task berjalan; kalau hanya variabel lokal,
+//   task bisa berhenti diam-diam dan tidak pernah mengirim teks.
+// - Setelah jeda bicara, hasil bisa "mulai dari nol" (atau task selesai sendiri, batas ±1 menit).
+//   Teks sebelumnya disimpan di `committed` dan task baru dibuka selama masih merekam.
+// - Model on-device id-ID belum tentu terpasang walau `supportsOnDeviceRecognition` true:
+//   kalau gagal sebelum ada teks, ulang sekali lewat server Apple.
 
 final class Voice {
     let engine = AVAudioEngine()
+    var recognizer: SFSpeechRecognizer?
     var req: SFSpeechAudioBufferRecognitionRequest?
     var task: SFSpeechRecognitionTask?
-    var text = ""
+    var committed = ""          // teks dari segmen yang sudah selesai
+    var partial = ""            // teks segmen yang sedang berjalan
+    var onDevice = false
+    var recording = false       // mikrofon masih aktif (belum Selesai/Batal)
+    var gen = 0                 // penanda task; callback task lama diabaikan
+    var openedAt = Date()
+    var quickFails = 0          // task yang langsung gagal berturut-turut (cegah loop)
     var lastPush = Date.distantPast
+    // Audio awal disimpan sampai teks pertama muncul, supaya bisa diputar ulang saat pindah ke server.
+    private let lock = NSLock()
+    private var early: [AVAudioPCMBuffer] = []
+    private var earlyFrames: AVAudioFramePosition = 0
+    private var keepEarly = true
     var level: Float = 0
-    var push: ((String, Float, Bool) -> Void)?
+    /// (teks, level, final, kodeError)
+    var push: ((String, Float, Bool, String) -> Void)?
+
+    var text: String { [committed, partial].filter { !$0.isEmpty }.joined(separator: " ") }
 
     func start(_ cb: @escaping (String?) -> Void) {
         SFSpeechRecognizer.requestAuthorization { st in
             DispatchQueue.main.async {
-                guard st == .authorized else { cb("SPEECH_DENIED"); return }
+                guard st == .authorized else { cb(st == .restricted ? "SPEECH_RESTRICTED" : "SPEECH_DENIED"); return }
                 AVCaptureDevice.requestAccess(for: .audio) { ok in
                     DispatchQueue.main.async {
                         guard ok else { cb("MIC_DENIED"); return }
@@ -392,19 +415,20 @@ final class Voice {
     }
 
     private func begin() -> String? {
-        let rec = SFSpeechRecognizer(locale: Locale(identifier: "id-ID")) ?? SFSpeechRecognizer()
-        guard let rec = rec, rec.isAvailable else { return "SPEECH_UNAVAILABLE" }
-        text = ""
-        let r = SFSpeechAudioBufferRecognitionRequest()
-        r.shouldReportPartialResults = true
-        if rec.supportsOnDeviceRecognition { r.requiresOnDeviceRecognition = true }
-        req = r
+        cancel()
+        guard let rec = SFSpeechRecognizer(locale: Locale(identifier: "id-ID")) else { return "SPEECH_UNAVAILABLE" }
+        guard rec.isAvailable else { return "SPEECH_UNAVAILABLE" }
+        recognizer = rec
+        onDevice = rec.supportsOnDeviceRecognition
+        committed = ""; partial = ""
+        resetEarly(keep: true)
         let input = engine.inputNode
         let fmt = input.outputFormat(forBus: 0)
+        guard fmt.sampleRate > 0, fmt.channelCount > 0 else { return "MIC_FAILED" }
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buf, _ in
             guard let self = self else { return }
-            self.req?.append(buf)
+            self.feed(buf)
             if let ch = buf.floatChannelData?[0] {
                 var sum: Float = 0
                 let n = Int(buf.frameLength)
@@ -412,35 +436,168 @@ final class Voice {
                 let rms = sqrt(sum / Float(max(n, 1)))
                 DispatchQueue.main.async {
                     self.level = min(1, rms * 12)
-                    if Date().timeIntervalSince(self.lastPush) > 0.12 { self.lastPush = Date(); self.push?(self.text, self.level, false) }
+                    if Date().timeIntervalSince(self.lastPush) > 0.12 { self.lastPush = Date(); self.push?(self.text, self.level, false, "") }
                 }
             }
         }
-        task = rec.recognitionTask(with: r) { [weak self] res, err in
-            guard let self = self else { return }
-            DispatchQueue.main.async {
-                if let res = res { self.text = res.bestTranscription.formattedString; self.push?(self.text, self.level, res.isFinal) }
-                if err != nil && self.engine.isRunning == false { self.push?(self.text, 0, true) }
-            }
-        }
         engine.prepare()
-        do { try engine.start() } catch { return "MIC_FAILED" }
+        do { try engine.start() } catch { input.removeTap(onBus: 0); return "MIC_FAILED" }
+        recording = true
+        quickFails = 0
+        openTask()
         return nil
     }
 
+    private func feed(_ buf: AVAudioPCMBuffer) {
+        lock.lock()
+        if keepEarly, earlyFrames < AVAudioFramePosition(buf.format.sampleRate * 20) {
+            early.append(buf); earlyFrames += AVAudioFramePosition(buf.frameLength)
+        }
+        let r = req
+        lock.unlock()
+        r?.append(buf)
+    }
+
+    private func resetEarly(keep: Bool) {
+        lock.lock(); early = []; earlyFrames = 0; keepEarly = keep; lock.unlock()
+    }
+
+    /// Buka task pengenalan baru. Dipanggil saat mulai, setelah segmen selesai, atau untuk ulang lewat server.
+    private func openTask(replay: Bool = false) {
+        guard let rec = recognizer else { return }
+        gen += 1
+        let my = gen
+        openedAt = Date()
+        let r = SFSpeechAudioBufferRecognitionRequest()
+        r.shouldReportPartialResults = true
+        r.requiresOnDeviceRecognition = onDevice
+        if #available(macOS 13, *) { r.addsPunctuation = true }
+        lock.lock()
+        for b in early where replay { r.append(b) }   // pindah ke server: putar ulang audio awal
+        req = r
+        lock.unlock()
+        task = rec.recognitionTask(with: r) { [weak self] res, err in
+            DispatchQueue.main.async { self?.handle(my, res, err) }
+        }
+    }
+
+    private func handle(_ my: Int, _ res: SFSpeechRecognitionResult?, _ err: Error?) {
+        guard my == gen else { return }
+        if let res = res {
+            let s = res.bestTranscription.formattedString
+            // Hasil mulai dari nol setelah jeda: simpan segmen sebelumnya.
+            if !partial.isEmpty, !s.isEmpty, s.count < partial.count, !partial.lowercased().hasPrefix(s.lowercased().prefix(8)) {
+                commitPartial()
+            }
+            if !s.isEmpty { resetEarly(keep: false) }
+            partial = s
+            if res.isFinal { commitPartial() }
+            push?(text, level, false, "")
+        }
+        let ended = (res?.isFinal ?? false) || err != nil
+        guard ended else { return }
+        if let err = err, text.isEmpty, !isNoSpeech(err) {
+            // Gagal sebelum ada teks. On-device belum siap → coba sekali lewat server Apple.
+            if onDevice && recording { onDevice = false; openTask(replay: true); return }
+            if recording || task != nil { push?("", 0, true, code(err)); hardStop(); return }
+        }
+        if recording {
+            if err != nil, Date().timeIntervalSince(openedAt) < 1.5 { quickFails += 1 } else { quickFails = 0 }
+            if quickFails >= 3 { push?(text, 0, true, text.isEmpty ? code(err!) : ""); hardStop(); return }
+            openTask()           // masih merekam: lanjut segmen berikutnya
+        } else {
+            task = nil; req = nil
+            push?(text, 0, true, "")
+        }
+    }
+
+    private func commitPartial() {
+        let p = partial.trimmingCharacters(in: .whitespaces)
+        if !p.isEmpty { committed = committed.isEmpty ? p : committed + " " + p }
+        partial = ""
+    }
+
+    private func isNoSpeech(_ e: Error) -> Bool {
+        let n = e as NSError
+        return n.domain == "kAFAssistantErrorDomain" && [1110, 216, 209].contains(n.code)
+    }
+
+    private func code(_ e: Error) -> String {
+        let n = e as NSError
+        let msg = n.localizedDescription.lowercased()
+        if msg.contains("siri") || msg.contains("dictation") || msg.contains("dikte") || [1101, 1700].contains(n.code) { return "SPEECH_DICTATION_OFF" }
+        if msg.contains("network") || msg.contains("internet") || msg.contains("jaringan") || [1107, 203, 301].contains(n.code) { return "SPEECH_NETWORK" }
+        NSLog("Katnis suara: \(n.domain) \(n.code) \(n.localizedDescription)")
+        return "SPEECH_FAILED"
+    }
+
+    private func hardStop() {
+        recording = false
+        if engine.isRunning { engine.stop() }
+        engine.inputNode.removeTap(onBus: 0)
+        gen += 1
+        task?.cancel(); task = nil; req = nil
+    }
+
     func stop() {
-        if engine.isRunning { engine.stop(); engine.inputNode.removeTap(onBus: 0) }
+        guard recording else { push?(text, 0, true, ""); return }
+        recording = false
+        if engine.isRunning { engine.stop() }
+        engine.inputNode.removeTap(onBus: 0)
         req?.endAudio()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            guard let self = self else { return }
+        let my = gen
+        // Batas tunggu kalau task tidak pernah mengirim hasil akhir.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            guard let self = self, my == self.gen else { return }
+            self.gen += 1
+            self.commitPartial()
             self.task?.finish(); self.task = nil; self.req = nil
-            self.push?(self.text, 0, true)
+            self.push?(self.text, 0, true, "")
         }
     }
 
     func cancel() {
-        if engine.isRunning { engine.stop(); engine.inputNode.removeTap(onBus: 0) }
-        task?.cancel(); task = nil; req = nil
+        hardStop()
+        committed = ""; partial = ""
+        resetEarly(keep: false)
+    }
+
+    // MARK: Mode uji: jalur rekam yang sama, tapi audio dari file (pengganti mikrofon), kecepatan waktu nyata
+    func simulate(_ url: URL, done: @escaping (String, String) -> Void) {
+        SFSpeechRecognizer.requestAuthorization { _ in DispatchQueue.main.async {
+            guard let rec = SFSpeechRecognizer(locale: Locale(identifier: "id-ID")), let file = try? AVAudioFile(forReading: url) else { done("", "setup"); return }
+            self.recognizer = rec; self.onDevice = rec.supportsOnDeviceRecognition
+            self.committed = ""; self.partial = ""; self.recording = true; self.quickFails = 0; self.resetEarly(keep: true)
+            var lastErr = ""
+            self.push = { t, _, final, e in if !e.isEmpty { lastErr = e }; if final { done(t, lastErr) } }
+            self.openTask()
+            let fmt = file.processingFormat, chunk: AVAudioFrameCount = 4096
+            func feed() {
+                guard self.recording else { return }
+                guard let b = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: chunk), (try? file.read(into: b, frameCount: chunk)) != nil, b.frameLength > 0 else {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.stop() }; return
+                }
+                self.feed(b)
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(b.frameLength) / fmt.sampleRate) { feed() }
+            }
+            feed()
+        } }
+    }
+
+    // MARK: Mode uji: transkripsi file audio dengan pengaturan yang sama (id-ID, on-device bila ada)
+    static func transcribeFile(_ url: URL, onDevice: Bool?, done: @escaping (String, String) -> Void) {
+        SFSpeechRecognizer.requestAuthorization { st in
+            guard st == .authorized else { done("", "izin Pengenalan Ucapan: \(st.rawValue)"); return }
+            guard let rec = SFSpeechRecognizer(locale: Locale(identifier: "id-ID")) else { done("", "id-ID tidak didukung"); return }
+            let r = SFSpeechURLRecognitionRequest(url: url)
+            r.requiresOnDeviceRecognition = onDevice ?? rec.supportsOnDeviceRecognition
+            var t: SFSpeechRecognitionTask?
+            t = rec.recognitionTask(with: r) { res, err in
+                if let err = err as NSError? { done(res?.bestTranscription.formattedString ?? "", "\(err.domain) \(err.code) \(err.localizedDescription)"); _ = t; return }
+                if let res = res, res.isFinal { done(res.bestTranscription.formattedString, ""); _ = t; _ = rec }
+            }
+            _ = t
+        }
     }
 }
 
@@ -522,8 +679,8 @@ final class Bridge: NSObject, WKScriptMessageHandlerWithReply {
             if let p = body["path"] as? String, p.hasPrefix(lampDir.path) { try? fm.removeItem(atPath: p) }
             replyHandler(true, nil)
         case "voiceStart":
-            voice.push = { [weak self] text, level, final in
-                let payload = (try? JSONSerialization.data(withJSONObject: ["text": text, "level": level, "final": final])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+            voice.push = { [weak self] text, level, final, err in
+                let payload = (try? JSONSerialization.data(withJSONObject: ["text": text, "level": level, "final": final, "error": err])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
                 self?.js("window.Katnis&&Katnis.voice(\(payload))")
             }
             voice.start { err in replyHandler(["error": err ?? ""], nil) }
@@ -709,6 +866,28 @@ if let i = cli.firstIndex(of: "--jejak"), i + 1 < cli.count {
     let d = try! JSONSerialization.data(withJSONObject: r, options: [.prettyPrinted, .sortedKeys])
     print(String(data: d, encoding: .utf8)!)
     exit(0)
+}
+
+// Mode uji suara tanpa mikrofon. Jalankan lewat `open -n -W -a Katnis.app --args ...`
+// supaya izin Pengenalan Ucapan tercatat atas nama Katnis, bukan Terminal.
+//   --tes-rekam <file> --out <hasil.txt>          jalur rekam (streaming) dengan audio dari file
+//   --tes-suara <file> --out <hasil.txt> [--server]   transkripsi file sekali jalan
+func arg(_ k: String) -> String? { cli.firstIndex(of: k).flatMap { $0 + 1 < cli.count ? cli[$0 + 1] : nil } }
+func tulisHasil(_ s: String) { print(s, terminator: ""); if let o = arg("--out") { try? s.write(toFile: o, atomically: true, encoding: .utf8) } }
+if let f = arg("--tes-rekam") {
+    let v = Voice()
+    v.simulate(URL(fileURLWithPath: f)) { text, err in
+        tulisHasil("teks: \(text)\nerror: \(err)\nonDevice akhir: \(v.onDevice)\n"); exit(text.isEmpty ? 1 : 0)
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 150) { tulisHasil("timeout\n"); exit(3) }
+    RunLoop.main.run()
+}
+if let f = arg("--tes-suara") {
+    Voice.transcribeFile(URL(fileURLWithPath: f), onDevice: cli.contains("--server") ? false : nil) { text, err in
+        tulisHasil("teks: \(text)\nerror: \(err)\n"); exit(err.isEmpty ? 0 : 1)
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 60) { tulisHasil("timeout\n"); exit(3) }
+    RunLoop.main.run()
 }
 
 let app = NSApplication.shared
